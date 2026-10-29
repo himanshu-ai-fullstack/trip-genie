@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: genie
+      POSTGRES_PASSWORD: genie
+      POSTGRES_DB: genie
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U genie"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  api:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://genie:genie@postgres:5432/genie
+      REDIS_URL: redis://redis:6379
+      PORT: "8787"
+    ports: ["8787:8787"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  web:
+    build: { context: ., dockerfile: apps/web/Dockerfile }
+    environment:
+      GENIE_API_URL: http://api:8787
+    ports: ["3000:3000"]
+    depends_on: [api]
+
+volumes:
+  pgdata:
