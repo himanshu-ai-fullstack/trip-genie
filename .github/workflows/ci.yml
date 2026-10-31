@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: genie
+          POSTGRES_PASSWORD: genie
+          POSTGRES_DB: genie
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U genie" --health-interval 5s --health-retries 10
+    env:
+      DATABASE_URL: postgres://genie:genie@localhost:5432/genie
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @trip-genie/api typecheck
+      - run: pnpm --filter @trip-genie/api test
+      - name: Evals (offline agent)
+        run: pnpm --filter @trip-genie/api evals
+        env:
+          DATABASE_URL: ""
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @trip-genie/web build

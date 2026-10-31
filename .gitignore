@@ -5,4 +5,5 @@ dist/
 .env.local
 *.log
 coverage/
-evals/results/
+**/evals/results/
+*.tsbuildinfo
