@@ -1,0 +1,1 @@
+"""Trip Genie FastAPI service."""

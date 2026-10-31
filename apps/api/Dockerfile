@@ -1,15 +1,9 @@
-FROM node:22-slim AS build
-WORKDIR /repo
-RUN corepack enable
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-COPY apps/api/package.json apps/api/
-RUN pnpm install --frozen-lockfile --filter @trip-genie/api...
-COPY apps/api apps/api
-RUN pnpm --filter @trip-genie/api build
-
-FROM node:22-slim
-WORKDIR /repo/apps/api
-ENV NODE_ENV=production
-COPY --from=build /repo /repo
+FROM python:3.12-slim
+WORKDIR /app
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+COPY apps/api/requirements.txt ./requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY apps/api/app ./app
+COPY apps/api/db ./db
 EXPOSE 8787
-CMD ["node", "dist/main.js"]
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787"]
