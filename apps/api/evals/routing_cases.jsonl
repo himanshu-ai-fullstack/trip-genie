@@ -1,0 +1,25 @@
+{"message": "things to do in Rome", "task": "recommend", "model": "claude-sonnet-5-5"}
+{"message": "Fun things to do in Lisbon with kids under $60", "task": "recommend", "model": "claude-sonnet-5-5"}
+{"message": "best street food in Singapore", "task": "recommend", "model": "claude-sonnet-5-5"}
+{"message": "adventurous stuff near Bali, we love surfing", "task": "recommend", "model": "claude-sonnet-5-5"}
+{"message": "cheap museums in Paris", "task": "recommend", "model": "claude-sonnet-5-5"}
+{"message": "romantic evening ideas in Barcelona for my partner", "task": "recommend", "model": "claude-sonnet-5-5"}
+{"message": "Food and museums in Rome and Paris", "task": "recommend", "model": "claude-opus-5-5"}
+{"message": "Dubai with kids, wheelchair access, vegetarian food, under $50", "task": "recommend", "model": "claude-opus-5-5"}
+{"message": "Plan a 3 day trip to Lisbon", "task": "itinerary", "model": "claude-sonnet-5-5"}
+{"message": "3 day plan for Tokyo", "task": "itinerary", "model": "claude-sonnet-5-5"}
+{"message": "Plan a 7 day trip to Tokyo", "task": "itinerary", "model": "claude-opus-5-5"}
+{"message": "Plan 10 days across Paris and Rome", "task": "itinerary", "model": "claude-opus-5-5"}
+{"message": "make me an itinerary for London", "task": "itinerary", "model": "claude-sonnet-5-5"}
+{"message": "plan our weekend in Barcelona", "task": "itinerary", "model": "claude-sonnet-5-5"}
+{"message": "concerts in London this weekend", "task": "events", "model": "claude-sonnet-5-5"}
+{"message": "any shows in New York tonight?", "task": "events", "model": "claude-sonnet-5-5"}
+{"message": "flamenco show tickets in Barcelona", "task": "events", "model": "claude-sonnet-5-5"}
+{"message": "theatre in London in December", "task": "events", "model": "claude-sonnet-5-5"}
+{"message": "what can I do in Berlin", "task": "clarify", "model": "claude-haiku-5-5"}
+{"message": "I want to visit Prague", "task": "clarify", "model": "claude-haiku-5-5"}
+{"message": "hi there", "task": "clarify", "model": "claude-haiku-5-5"}
+{"message": "where should I go for a beach holiday?", "task": "clarify", "model": "claude-haiku-5-5"}
+{"message": "swap the second one in Rome for something cheaper", "task": "refine", "model": "claude-sonnet-5-5"}
+{"message": "more like that in Tokyo please", "task": "refine", "model": "claude-sonnet-5-5"}
+{"message": "that doesn't work for us, try again in Paris", "rejected": true, "task": "refine", "model": "claude-opus-5-5"}

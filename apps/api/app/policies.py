@@ -1,26 +1,57 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import random
 import re
 import time
 from collections import defaultdict
-from .models import Intent
+from .models import Intent, Route
 
 MODELS = {"helper": "claude-haiku-5-5", "standard": "claude-sonnet-5-5", "planner": "claude-opus-5-5"}
-FALLBACK = {"claude-opus-5-5": "claude-sonnet-5-5", "claude-sonnet-5-5": "claude-sonnet-5"}
-MAX_TURNS = {"claude-sonnet-5-5": 8, "claude-sonnet-5": 8, "claude-opus-5-5": 14}
+FALLBACK = {"claude-opus-5-5": "claude-sonnet-5-5", "claude-sonnet-5-5": "claude-sonnet-5", "claude-haiku-5-5": "claude-sonnet-5-5"}
+MAX_TURNS = {"claude-haiku-5-5": 4, "claude-sonnet-5-5": 8, "claude-sonnet-5": 8, "claude-opus-5-5": 14}
 LIMITS = {
     "ip_per_minute": int(os.getenv("GENIE_IP_PER_MINUTE", "20")),
     "session_per_hour": int(os.getenv("GENIE_SESSION_PER_HOUR", "60")),
     "turn_budget_usd": float(os.getenv("GENIE_TURN_BUDGET_USD", "0.5")),
     "session_budget_usd": float(os.getenv("GENIE_SESSION_BUDGET_USD", "3")),
     "turn_timeout_ms": int(os.getenv("GENIE_TURN_TIMEOUT_MS", "90000")),
+    "max_tool_calls": int(os.getenv("GENIE_MAX_TOOL_CALLS", "24")),
     "max_question_chars": 2000,
 }
 REJECTION = re.compile(r"\b(doesn'?t work|does not work|not what i|don'?t like|too expensive|wrong|try again|that'?s not|no good|bad plan)\b", re.I)
+EVENT_WORDS = re.compile(r"\b(tonight|tomorrow|this (?:week|weekend)|next (?:week|weekend)|tickets?|concerts?|gigs?|match(?:es)?|festivals?|events?)\b", re.I)
+PLAN_WORDS = re.compile(r"\b(itinerary|plan|schedule|day by day|day-by-day)\b", re.I)
+NAMED_PLACE = re.compile(r"\b(?:in|to|visit(?:ing)?|around)\s+[A-Z][a-z]+")
 
 
-def route_model(intent: Intent, rejected: bool = False, planner_disabled: bool = False):
+def is_rejection(message: str) -> bool:
+    return REJECTION.search(message) is not None
+
+
+def classify_task(intent: Intent, message: str = "", rejected: bool = False):
+    """Rules-first task classification. Returns (task, confidence, reason); every branch is testable."""
+    if rejected:
+        return "refine", 0.9, "previous answer rejected"
+    if not intent.cities:
+        if NAMED_PLACE.search(message):
+            return "clarify", 0.6, "destination not in the catalog"
+        return "clarify", 0.9, "no destination yet"
+    if intent.follow_up:
+        return "refine", 0.75, "follow-up on an earlier answer"
+    events = EVENT_WORDS.search(message) is not None
+    # "concerts this weekend" carries a day count but asks for events, not a plan, unless they say plan.
+    if (events or ("show" in intent.categories and intent.month)) and not PLAN_WORDS.search(message):
+        return "events", 0.8 if events and "show" in intent.categories else 0.65, "dated shows or events"
+    if intent.wants_itinerary:
+        return ("itinerary", 0.9, f"{intent.days}-day plan") if intent.days else ("itinerary", 0.65, "plan without a length")
+    return "recommend", 0.85 if intent.categories or intent.budget_usd is not None else 0.7, "activity recommendations"
+
+
+def route_model(intent: Intent, rejected: bool = False, planner_disabled: bool = False, message: str = ""):
+    """Picks the task handler, then the cheapest model tier that can do it (helper < standard < planner)."""
+    task, confidence, task_reason = classify_task(intent, message, rejected)
     reasons = []
     if len(intent.cities) >= 2:
         reasons.append(f"{len(intent.cities)} cities")
@@ -30,11 +61,15 @@ def route_model(intent: Intent, rejected: bool = False, planner_disabled: bool =
         reasons.append(f"{len(intent.constraints)} hard constraints")
     if rejected:
         reasons.append("previous answer rejected")
-    if not reasons:
-        return {"model": MODELS["standard"], "reason": "standard request"}
-    if planner_disabled:
-        return {"model": MODELS["standard"], "reason": f"planner disabled (would route: {', '.join(reasons)})"}
-    return {"model": MODELS["planner"], "reason": ", ".join(reasons)}
+    if reasons and not planner_disabled:
+        model, reason = MODELS["planner"], ", ".join(reasons)
+    elif reasons:
+        model, reason = MODELS["standard"], f"planner disabled (would route: {', '.join(reasons)})"
+    elif task == "clarify":
+        model, reason = MODELS["helper"], f"{task_reason}, using helper model"
+    else:
+        model, reason = MODELS["standard"], "standard request"
+    return Route(task=task, model=model, confidence=confidence, reason=reason, needs_clarification=task == "clarify").model_dump()
 
 
 class CircuitBreaker:
@@ -65,7 +100,18 @@ class CircuitBreaker:
 
 
 def transient_model_error(error: Exception) -> bool:
-    return re.search(r"\b(overloaded|529|500|502|503|504|rate.?limit|429|timeout|ECONNRESET)\b", str(error), re.I) is not None
+    """Timeouts, 429 and 5xx are worth retrying; 4xx validation and auth errors are not."""
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError, ConnectionError)):
+        return True
+    status = getattr(error, "status_code", None) or getattr(getattr(error, "response", None), "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or status >= 500
+    return re.search(r"\b(overloaded|529|500|502|503|504|rate.?limit|429|timeout|timed out|ECONNRESET)\b", str(error), re.I) is not None
+
+
+def backoff_delay(attempt: int, base: float = 0.25, cap: float = 2.0) -> float:
+    """Exponential backoff with full jitter, so concurrent retries don't line up."""
+    return random.uniform(0, min(cap, base * 2 ** attempt))
 
 
 class KillSwitch:

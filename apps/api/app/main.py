@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date
@@ -15,13 +16,14 @@ from fastapi.responses import StreamingResponse
 from .catalog import ACTIVITIES
 from .intent import effective_intent, extract_intent, merge_profile
 from .models import ChatRequest, KillSwitchRequest, SessionMessage
-from .policies import CircuitBreaker, LIMITS, KillSwitch, check_rate_limits, check_session_budget, record_spend, route_model, transient_model_error
+from .policies import CircuitBreaker, LIMITS, KillSwitch, check_rate_limits, check_session_budget, is_rejection, record_spend, route_model, transient_model_error
 from .prompt import build_turn_prompt
 from .providers import Providers
 from .retrieval import MemoryActivityIndex, PgActivityIndex, create_embedder, cosine
 from .runner import create_runner
 from .stores import MemoryAnswerCache, SessionStore, create_kv, PgAnswerCache
 from .tools import GenieTools
+from .trace import RunTrace
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("trip_genie")
@@ -111,12 +113,27 @@ async def health(request: Request):
 
 @app.post("/api/admin/kill-switch")
 async def set_kill_switch(body: KillSwitchRequest, request: Request, authorization: Optional[str] = Header(default=None)):
-    token = os.getenv("ADMIN_TOKEN")
-    if not token or authorization != f"Bearer {token}":
+    if not _authorized(authorization):
         raise HTTPException(status_code=401, detail="unauthorized")
     await request.app.state.deps["kill_switch"].set(body.mode)
     logger.info("kill_switch mode=%s", body.mode)
     return {"mode": body.mode}
+
+
+def _authorized(authorization: Optional[str]) -> bool:
+    token = os.getenv("ADMIN_TOKEN")
+    return bool(token) and authorization == f"Bearer {token}"
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str, request: Request, authorization: Optional[str] = Header(default=None)):
+    """The durable trace of one turn: route, each model and tool step, checks, cost and outcome."""
+    if not _authorized(authorization):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    run = await RunTrace.load(request.app.state.deps["kv"], run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
 
 
 def _sse(event: dict) -> bytes:
@@ -181,13 +198,16 @@ async def run_turn(deps, session_id: str, message: str, ip: str):
 
 async def _turn_events(deps, session_id, message, ip, emit):
     kv, kill_switch = deps["kv"], deps["kill_switch"]
+    trace = RunTrace(kv, session_id, message)
     mode = await kill_switch.mode()
     if mode == "off":
         await emit({"type": "text", "delta": RESTING_MESSAGE})
-        yield {"type": "done", "model": "offline", "routeReason": "kill switch off", "cached": False, "costUsd": 0, "turns": 0, "stoppedEarly": None}
+        await trace.finish("stopped", stoppedBy="kill switch")
+        yield {"type": "done", "model": "offline", "routeReason": "kill switch off", "cached": False, "costUsd": 0, "turns": 0, "stoppedEarly": None, "runId": trace.run_id}
         return
     reason = await check_rate_limits(kv, ip, session_id) or await check_session_budget(kv, session_id)
     if reason:
+        await trace.finish("rejected", error=reason)
         yield {"type": "error", "message": reason}
         return
 
@@ -200,6 +220,7 @@ async def _turn_events(deps, session_id, message, ip, emit):
     catalog_version = await deps["index"].version()
     embedding = (await deps["embedder"].embed([message]))[0] if cacheable else None
     if cacheable and embedding:
+        lookup_started = time.monotonic()
         hit = await deps["cache"].lookup(key, embedding, catalog_version, _similarity_threshold(deps["embedder"]), cosine)
         if hit:
             logger.info("cache_hit key=%s similarity=%.3f", key, hit["similarity"])
@@ -213,27 +234,31 @@ async def _turn_events(deps, session_id, message, ip, emit):
             text = "".join(e["delta"] for e in hit["answer"]["events"] if e["type"] == "text")
             shown = [a for e in hit["answer"]["events"] if e["type"] in ("cards", "itinerary") for a in e["activities"]]
             await _remember(deps, session, message, text, shown, hit["answer"]["model"])
-            yield {"type": "done", "model": hit["answer"]["model"], "routeReason": "answer cache", "cached": True, "costUsd": 0, "turns": 0, "stoppedEarly": None}
+            await trace.step("cache", "answer_cache", "ok", (time.monotonic() - lookup_started) * 1000, similarity=round(hit["similarity"], 3))
+            await trace.finish("done", cached=True)
+            yield {"type": "done", "model": hit["answer"]["model"], "routeReason": "answer cache", "cached": True, "costUsd": 0, "turns": 0, "stoppedEarly": None, "runId": trace.run_id}
             return
 
-    route = route_model(intent, bool(session.history and re.search(r"\b(doesn'?t work|does not work|not what i|don'?t like|too expensive|wrong|try again|that'?s not|no good|bad plan)\b", message, re.I)), mode == "degraded")
+    route = route_model(intent, bool(session.history) and is_rejection(message), mode == "degraded", message)
     resolved = deps["breaker"].resolve(route["model"])
     model = resolved["model"]
     route_reason = route["reason"] + ("; breaker open, using fallback" if resolved["tripped"] else "")
-    logger.info("route model=%s reason=%s", model, route_reason)
+    logger.info("route task=%s confidence=%.2f model=%s reason=%s", route["task"], route["confidence"], model, route_reason)
+    await trace.set_route({**route, "model": model, "reason": route_reason})
+    route_fields = {"runId": trace.run_id, "task": route["task"], "confidence": route["confidence"]}
     recorded = []
     async def tool_emit(event):
         if event["type"] in ("cards", "itinerary"):
             recorded.append(event)
         await emit(event)
-    tools = GenieTools(deps["index"], deps["providers"], kv, tool_emit, intent.party, mode == "degraded")
+    tools = GenieTools(deps["index"], deps["providers"], kv, tool_emit, intent.party, mode == "degraded", intent.budget_usd, trace)
     streamed = ""
     async def emit_text(delta):
         nonlocal streamed
         streamed += delta
         await emit({"type": "text", "delta": delta})
     try:
-        prompt = build_turn_prompt(session, message, date.today().isoformat())
+        prompt = build_turn_prompt(session, message, date.today().isoformat(), route["task"])
         async def execute(selected_model):
             return await asyncio.wait_for(
                 deps["runner"].run(selected_model, prompt, message, intent, tools, emit_text),
@@ -247,6 +272,7 @@ async def _turn_events(deps, session_id, message, ip, emit):
                 raise
             deps["breaker"].record_failure(model)
             logger.warning("model fallback primary=%s fallback=%s", model, fallback)
+            await trace.step("model", model, "fallback", 0, error=str(error)[:200])
             route_reason += "; primary failed, using fallback"
             model = fallback
             result = await execute(model)
@@ -254,20 +280,29 @@ async def _turn_events(deps, session_id, message, ip, emit):
         await record_spend(kv, session_id, result["cost_usd"])
         stopped = result["stopped_early"]
         shown = [a for e in recorded for a in e["activities"]]
-        if cacheable and embedding and not stopped and shown:
+        grounding = tools.grounding_issues(result["text"])
+        await trace.check("grounding", grounding)
+        if grounding:
+            logger.warning("ungrounded answer run=%s issues=%s", trace.run_id, grounding)
+        # Only verified answers are cached, so one ungrounded reply is not replayed for 24 hours.
+        if cacheable and embedding and not stopped and shown and not grounding:
             await deps["cache"].store(key, message, embedding, {"events": [{"type": "text", "delta": result["text"]}] + recorded, "model": result["answered_by"]}, catalog_version)
         await _remember(deps, session, message, result["text"], shown, result["answered_by"])
+        await trace.finish("stopped" if stopped else "done", model=result["answered_by"], stoppedEarly=stopped, turns=result["turns"])
         yield {"type": "done", "model": result["answered_by"], "routeReason": route_reason, "cached": False,
-               "costUsd": result["cost_usd"], "turns": result["turns"], "stoppedEarly": stopped}
-    except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError):
+               "costUsd": result["cost_usd"], "turns": result["turns"], "stoppedEarly": stopped, **route_fields}
+    except (TimeoutError, asyncio.TimeoutError, asyncio.CancelledError) as error:
         await _remember(deps, session, message, streamed, [a for e in recorded for a in e["activities"]], model)
-        if isinstance(asyncio.current_task(), asyncio.Task) and asyncio.current_task().cancelling():
+        await trace.finish("aborted", model=model)
+        # The browser went away (Stop button): let the cancellation finish. A turn timeout still reports done.
+        if isinstance(error, asyncio.CancelledError):
             raise
-        yield {"type": "done", "model": model, "routeReason": route_reason, "cached": False, "costUsd": 0, "turns": 0, "stoppedEarly": "aborted"}
+        yield {"type": "done", "model": model, "routeReason": route_reason, "cached": False, "costUsd": 0, "turns": 0, "stoppedEarly": "aborted", **route_fields}
     except Exception as error:
         if transient_model_error(error):
             deps["breaker"].record_failure(model)
         logger.exception("turn error model=%s", model)
+        await trace.finish("error", model=model, error=str(error)[:300])
         yield {"type": "error", "message": "Genie hit a problem answering that. Please try again."}
 
 

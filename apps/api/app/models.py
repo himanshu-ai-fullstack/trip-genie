@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field
 Category = Literal["sightseeing", "adventure", "show", "food", "culture"]
 Party = Literal["solo", "couple", "family", "group"]
 KillSwitchMode = Literal["on", "degraded", "off"]
+TaskType = Literal["recommend", "itinerary", "events", "refine", "clarify"]
 ModelId = str
 
 
@@ -74,6 +75,15 @@ class ItineraryDay(BaseModel):
     day: int
     city: str
     stops: list[ItineraryStop]
+
+
+class Route(BaseModel):
+    """What the router decided for one turn: which task handler and which model, with why."""
+    task: TaskType
+    model: ModelId
+    confidence: float = Field(ge=0, le=1)
+    reason: str
+    needs_clarification: bool = False
 
 
 class ChatRequest(BaseModel):

@@ -157,6 +157,7 @@ export default function Home() {
               {t.error && <div className="error">{t.error}</div>}
               {t.meta && (
                 <div className="meta">
+                  {t.meta.task ? `${t.meta.task} · ` : ""}
                   {t.meta.cached ? "from cache" : t.meta.model} · {t.meta.routeReason}
                   {t.meta.costUsd > 0 ? ` · $${t.meta.costUsd.toFixed(4)}` : ""}
                   {t.meta.stoppedEarly ? ` · stopped: ${t.meta.stoppedEarly}` : ""}

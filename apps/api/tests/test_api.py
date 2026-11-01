@@ -66,3 +66,20 @@ def test_transient_model_failure_retries_with_fallback(monkeypatch):
         assert runner.models == ["claude-sonnet-5-5", "claude-sonnet-5"]
         assert done["model"] == "claude-sonnet-5"
         assert "using fallback" in done["routeReason"]
+
+
+def test_each_turn_is_traced_and_readable_by_admins(monkeypatch):
+    monkeypatch.setenv("GENIE_OFFLINE", "1")
+    monkeypatch.setenv("ADMIN_TOKEN", "test-admin")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    with TestClient(app) as client:
+        response = client.post("/api/chat", json={"message": "Food and museums in Rome and Paris", "sessionId": "trace-session"})
+        done = next(event for event in _events(response.text) if event["type"] == "done")
+        assert done["task"] == "recommend" and done["runId"]
+        assert client.get(f"/api/runs/{done['runId']}").status_code == 401
+        run = client.get(f"/api/runs/{done['runId']}", headers={"Authorization": "Bearer test-admin"}).json()
+        assert run["status"] == "done" and run["route"]["model"] == "claude-opus-5-5"
+        searches = [step for step in run["steps"] if step["name"] == "search_activities"]
+        assert len(searches) == 2 and all(step["status"] == "ok" for step in searches)
+        assert run["totals"]["toolCalls"] == 3
+        assert any(check["name"] == "grounding" and check["passed"] for check in run["checks"])

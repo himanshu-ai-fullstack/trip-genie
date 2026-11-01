@@ -1,4 +1,4 @@
-// Mirrors apps/api/src/types.ts GenieEvent.
+// Mirrors the SSE events emitted by apps/api/app/main.py.
 export type Activity = {
   id: string;
   name: string;
@@ -22,7 +22,7 @@ export type GenieEvent =
   | { type: "text"; delta: string }
   | { type: "cards"; activities: Activity[] }
   | { type: "itinerary"; days: ItineraryDay[]; activities: Activity[] }
-  | { type: "done"; model: string; routeReason: string; cached: boolean; costUsd: number; turns: number; stoppedEarly: string | null }
+  | { type: "done"; model: string; routeReason: string; cached: boolean; costUsd: number; turns: number; stoppedEarly: string | null; runId?: string; task?: string; confidence?: number }
   | { type: "error"; message: string };
 
 export type Turn = {

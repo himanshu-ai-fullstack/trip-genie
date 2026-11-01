@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
-from datetime import datetime
+import time
 from .prompt import SYSTEM_PROMPT
-from .tools import GenieTools, tool_schemas
+from .tools import READ_ONLY_TOOLS, GenieTools, tool_schemas
 from .policies import MAX_TURNS, LIMITS
 
 COST_RATES = {
@@ -31,12 +32,11 @@ class OfflineRunner:
             await emit_text(text)
             return {"text": text, "cost_usd": 0, "turns": 1, "stopped_early": None, "answered_by": "offline"}
 
-        activities = []
-        for city in cities:
-            turns += 1
-            result = await tools.call("search_activities", {"city": city, "query": message,
-                "categories": intent.categories or None, "max_price_usd": budget, "limit": 10})
-            activities.extend(tools.search_result([a["id"] for a in result.get("results", [])]))
+        # Sectioning: one independent search per city, run concurrently, merged in city order.
+        searches = await asyncio.gather(*(tools.call("search_activities", {"city": city, "query": message,
+            "categories": intent.categories or None, "max_price_usd": budget, "limit": 10}) for city in cities))
+        turns += len(cities)
+        activities = [a for result in searches for a in tools.search_result([row["id"] for row in result.get("results", [])])]
         if not activities:
             text = f"I couldn't find matches in {' and '.join(cities)} for that. Try a higher budget or different interests."
             await emit_text(text)
@@ -98,6 +98,7 @@ class AnthropicRunner:
         cost_usd = 0.0
         input_rate, output_rate = COST_RATES.get(model, (0.0, 0.0))
         for turn in range(1, MAX_TURNS.get(model, 8) + 1):
+            started = time.monotonic()
             async with self.client.messages.stream(model=model, max_tokens=2048, system=SYSTEM_PROMPT,
                 messages=transcript, tools=tool_schemas()) as stream:
                 async for event in stream:
@@ -105,8 +106,13 @@ class AnthropicRunner:
                         final_text += event.delta.text
                         await emit_text(event.delta.text)
                 response = await stream.get_final_message()
-            cost_usd += (response.usage.input_tokens * input_rate + response.usage.output_tokens * output_rate) / 1_000_000
-            transcript.append({"role": "assistant", "content": [block.model_dump() for block in response.content]})
+            step_cost = (response.usage.input_tokens * input_rate + response.usage.output_tokens * output_rate) / 1_000_000
+            cost_usd += step_cost
+            if tools.trace:
+                await tools.trace.step("model", response.model, "ok", (time.monotonic() - started) * 1000, turn=turn,
+                    inputTokens=response.usage.input_tokens, outputTokens=response.usage.output_tokens, costUsd=step_cost,
+                    stopReason=response.stop_reason)
+            transcript.append({"role": "assistant", "content": [content_param(block) for block in response.content]})
             tool_uses = [block for block in response.content if block.type == "tool_use"]
             if not tool_uses:
                 return {"text": final_text, "cost_usd": cost_usd, "turns": turn, "stopped_early": None, "answered_by": response.model}
@@ -115,19 +121,37 @@ class AnthropicRunner:
                 await emit_text(note)
                 final_text += note
                 return {"text": final_text, "cost_usd": cost_usd, "turns": turn, "stopped_early": "budget", "answered_by": response.model}
-            results = []
-            for call in tool_uses:
-                try:
-                    output = await tools.call(call.name, call.input)
-                    is_error = "error" in output
-                except Exception as error:
-                    output, is_error = {"error": str(error)}, True
-                results.append({"type": "tool_result", "tool_use_id": call.id, "content": json.dumps(output), "is_error": is_error})
-            transcript.append({"role": "user", "content": results})
+            transcript.append({"role": "user", "content": await run_tool_calls(tools, tool_uses)})
         note = "\n\n(I stopped early to keep this quick. Ask me to keep going if you'd like more.)"
         await emit_text(note)
         final_text += note
         return {"text": final_text, "cost_usd": cost_usd, "turns": MAX_TURNS.get(model, 8), "stopped_early": "step limit", "answered_by": model}
+
+
+def content_param(block):
+    """Echo a response block back as a request block. SDK-only fields such as parsed_output are rejected by the API."""
+    if block.type == "text":
+        return {"type": "text", "text": block.text}
+    if block.type == "tool_use":
+        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+    return block.model_dump(exclude_none=True)
+
+
+async def run_tool_calls(tools: GenieTools, tool_uses):
+    """Read-only calls run concurrently; calls that render cards run afterwards in the order the model chose."""
+    async def run(call):
+        try:
+            output = await tools.call(call.name, call.input)
+        except Exception as error:
+            output = {"error": str(error), "error_type": "tool_error", "retryable": False}
+        return {"type": "tool_result", "tool_use_id": call.id, "content": json.dumps(output), "is_error": "error" in output}
+
+    parallel = [call for call in tool_uses if call.name in READ_ONLY_TOOLS]
+    results = dict(zip((call.id for call in parallel), await asyncio.gather(*(run(call) for call in parallel))))
+    for call in tool_uses:
+        if call.id not in results:
+            results[call.id] = await run(call)
+    return [results[call.id] for call in tool_uses]
 
 
 def re_search(pattern, text):
